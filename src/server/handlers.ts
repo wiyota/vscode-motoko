@@ -3,7 +3,7 @@ import { pascalCase } from 'change-case';
 import { exec, execSync } from 'child_process';
 import * as semver from 'semver';
 import * as glob from 'fast-glob';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync, readFileSync, watch, statSync } from 'fs';
 import { add as mopsAdd } from 'ic-mops/commands/add';
 import { AST, Node } from 'motoko/lib/ast';
 import { keywords } from 'motoko/lib/keywords';
@@ -22,6 +22,7 @@ import {
     InitializeResult,
     Location,
     MarkupKind,
+    MessageType,
     Position,
     Range,
     ReferenceParams,
@@ -114,6 +115,11 @@ interface MotokoSettings {
     hideWarningRegex: string;
     maxNumberOfProblems: number;
     debugHover: boolean;
+    fileWatching?: {
+        method?: 'client' | 'server' | 'hybrid' | 'polling';
+        pollingInterval?: number;
+        enableServerSide?: boolean;
+    };
 }
 
 const shouldHideWarnings = (uri: string) =>
@@ -123,6 +129,355 @@ export const documents = new TextDocuments(TextDocument);
 
 export const addHandlers = (connection: Connection, redirectConsole = true) => {
     const packageSourceCache = new Map();
+
+    // File watching state
+    const fileWatchers = new Map<string, any>();
+    const watchedDirectories = new Set<string>();
+    const fileModificationTimes = new Map<string, number>();
+    let useServerSideWatching = false;
+    let clientWatchingTimeout: NodeJS.Timeout | null = null;
+    let pollingInterval: NodeJS.Timeout | null = null;
+
+    // Settings cache to avoid repeated validation
+    let cachedFileWatchingSettings: MotokoSettings['fileWatching'] | null =
+        null;
+    let lastSettingsHash: string | null = null;
+
+    // Helper functions for cross-editor message compatibility
+    function sendMessage(
+        type: 'error' | 'warning' | 'info',
+        message: string,
+        detail?: string,
+        sendCustomNotification: boolean = true,
+    ) {
+        const fullMessage = detail ? `${message}\n\n${detail}` : message;
+        const logMessage = `${
+            type.charAt(0).toUpperCase() + type.slice(1)
+        }: ${message}${detail ? ` - ${detail}` : ''}`;
+
+        // Send custom notification (for VS Code) if requested
+        if (
+            sendCustomNotification &&
+            (type === 'error' || type === 'warning')
+        ) {
+            connection.sendNotification(ERROR_MESSAGE, {
+                message,
+                detail,
+            });
+        }
+
+        // Send standard LSP notification (for Zed and other editors)
+        switch (type) {
+            case 'error':
+                connection.window.showErrorMessage(fullMessage);
+                console.error(logMessage);
+                break;
+            case 'warning':
+                connection.window.showWarningMessage(fullMessage);
+                console.warn(logMessage);
+                break;
+            case 'info':
+                connection.window.showInformationMessage(fullMessage);
+                console.log(logMessage);
+                break;
+        }
+    }
+
+    function sendErrorMessage(message: string, detail?: string) {
+        sendMessage('error', message, detail);
+    }
+
+    function sendWarningMessage(message: string, detail?: string) {
+        sendMessage('warning', message, detail);
+    }
+
+    function sendInfoMessage(message: string, detail?: string) {
+        sendMessage('info', message, detail, false);
+    }
+
+    // Parse error messages into structured format
+    function parseErrorMessage(
+        error: any,
+        defaultMessage: string,
+        defaultDetail?: string,
+    ): { message: string; detail: string } {
+        const errorStr = String(error).replace(/^Error: /, '');
+        const lines = errorStr.split('\n');
+        const message = lines[0] || defaultMessage;
+        const detail =
+            lines.slice(1).join('\n') ||
+            defaultDetail ||
+            'Check console for more details';
+        return { message, detail };
+    }
+
+    // Helper function to create diagnostic objects
+    function createDiagnostic(
+        line: number,
+        startChar: number,
+        endChar: number,
+        message: string,
+    ): Diagnostic {
+        return {
+            range: {
+                start: { line, character: startChar },
+                end: { line, character: endChar },
+            },
+            message,
+            severity: DiagnosticSeverity.Error,
+            source: 'motoko',
+        };
+    }
+
+    // Parse mops error messages to provide better user feedback
+    function parseMopsError(error: string): {
+        message: string;
+        detail: string;
+        packageName?: string;
+        version?: string;
+    } {
+        const errorStr = String(error);
+
+        // Check for package not found errors
+        const packageNotFoundMatch = errorStr.match(
+            /Package "([^"]+)" not found/i,
+        );
+        if (packageNotFoundMatch) {
+            return {
+                message: `Package "${packageNotFoundMatch[1]}" not found`,
+                detail: `The package "${packageNotFoundMatch[1]}" does not exist in the Mops registry.\n\nPlease check:\n• Package name spelling\n• Package availability at https://mops.one`,
+                packageName: packageNotFoundMatch[1],
+            };
+        }
+
+        // Check for version not found errors
+        const versionNotFoundMatch = errorStr.match(
+            /Version "([^"]+)" of package "([^"]+)" not found/i,
+        );
+        if (versionNotFoundMatch) {
+            return {
+                message: `Version "${versionNotFoundMatch[1]}" of package "${versionNotFoundMatch[2]}" not found`,
+                detail: `The specified version "${versionNotFoundMatch[1]}" of package "${versionNotFoundMatch[2]}" does not exist.\n\nPlease check:\n• Available versions at https://mops.one/package/${versionNotFoundMatch[2]}\n• Version number format (e.g., "1.0.0", not "v1.0.0")`,
+                packageName: versionNotFoundMatch[2],
+                version: versionNotFoundMatch[1],
+            };
+        }
+
+        // Check for network/connectivity errors
+        if (
+            errorStr.includes('ENOTFOUND') ||
+            errorStr.includes('ECONNREFUSED') ||
+            errorStr.includes('network')
+        ) {
+            return {
+                message: 'Network error while fetching packages',
+                detail: 'Unable to connect to the Mops registry.\n\nPlease check:\n• Internet connection\n• Firewall settings\n• Proxy configuration',
+            };
+        }
+
+        // Check for authentication errors
+        if (errorStr.includes('401') || errorStr.includes('Unauthorized')) {
+            return {
+                message: 'Authentication error',
+                detail: 'Authentication failed when accessing the Mops registry.\n\nPlease check:\n• Mops authentication setup\n• Access permissions',
+            };
+        }
+
+        // Check for mops not installed
+        if (
+            errorStr.includes('command not found') ||
+            errorStr.includes('is not recognized')
+        ) {
+            return {
+                message: 'Mops not installed',
+                detail: 'Mops package manager is not installed or not in PATH.\n\nPlease install Mops:\n• npm install -g ic-mops\n• Or visit https://docs.mops.one/quick-start',
+            };
+        }
+
+        // Generic mops error
+        return {
+            message: 'Error while resolving Mops packages',
+            detail: `${errorStr}\n\nFor help, visit:\n• Mops documentation: https://docs.mops.one\n• Mops registry: https://mops.one`,
+        };
+    }
+
+    // Create diagnostics for package configuration files
+    function createPackageDiagnostics(
+        directory: string,
+        error: {
+            message: string;
+            detail: string;
+            packageName?: string;
+            version?: string;
+        },
+    ) {
+        const diagnostics: { uri: string; diagnostics: Diagnostic[] }[] = [];
+
+        // Check for mops.toml
+        const mopsPath = join(directory, 'mops.toml');
+        if (existsSync(mopsPath)) {
+            const mopsUri = URI.file(mopsPath).toString();
+            const mopsContent = getFileText(mopsPath);
+            const mopsDiagnostics = parseMopsTomlForErrors(mopsContent, error);
+
+            if (mopsDiagnostics.length > 0) {
+                diagnostics.push({
+                    uri: mopsUri,
+                    diagnostics: mopsDiagnostics,
+                });
+            }
+        }
+
+        // Check for vessel.dhall
+        const vesselPath = join(directory, 'vessel.dhall');
+        if (existsSync(vesselPath)) {
+            const vesselUri = URI.file(vesselPath).toString();
+            const vesselContent = getFileText(vesselPath);
+            const vesselDiagnostics = parseVesselDhallForErrors(
+                vesselContent,
+                error,
+            );
+
+            if (vesselDiagnostics.length > 0) {
+                diagnostics.push({
+                    uri: vesselUri,
+                    diagnostics: vesselDiagnostics,
+                });
+            }
+        }
+
+        return diagnostics;
+    }
+
+    function parseMopsTomlForErrors(
+        content: string,
+        error: {
+            message: string;
+            detail: string;
+            packageName?: string;
+            version?: string;
+        },
+    ): Diagnostic[] {
+        const diagnostics: Diagnostic[] = [];
+        const lines = content.split('\n');
+
+        if (!error.packageName) {
+            return diagnostics;
+        }
+
+        // Parse TOML dependencies section
+        let inDependenciesSection = false;
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+
+            if (line.trim().startsWith('[dependencies]')) {
+                inDependenciesSection = true;
+                continue;
+            }
+
+            if (
+                line.trim().startsWith('[') &&
+                line.trim() !== '[dependencies]'
+            ) {
+                inDependenciesSection = false;
+                continue;
+            }
+
+            if (inDependenciesSection) {
+                // Match package = "version" or package = { version = "version" }
+                const packageMatch = line.match(
+                    /^\s*([a-zA-Z0-9_-]+)\s*=\s*"([^"]+)"|^\s*([a-zA-Z0-9_-]+)\s*=\s*\{\s*version\s*=\s*"([^"]+)"/,
+                );
+                if (packageMatch) {
+                    const packageName = packageMatch[1] || packageMatch[3];
+                    const packageVersion = packageMatch[2] || packageMatch[4];
+
+                    if (packageName === error.packageName) {
+                        // Find the position of the package name or version in the line
+                        const startPos = line.indexOf(packageName);
+                        const endPos = startPos + packageName.length;
+
+                        // If it's a version error, highlight the version instead
+                        let highlightStart = startPos;
+                        let highlightEnd = endPos;
+
+                        if (error.version && packageVersion === error.version) {
+                            const versionStart = line.indexOf(packageVersion);
+                            if (versionStart !== -1) {
+                                highlightStart = versionStart;
+                                highlightEnd =
+                                    versionStart + packageVersion.length;
+                            }
+                        }
+
+                        diagnostics.push(
+                            createDiagnostic(
+                                i,
+                                highlightStart,
+                                highlightEnd,
+                                error.message,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+
+        return diagnostics;
+    }
+
+    function parseVesselDhallForErrors(
+        content: string,
+        error: {
+            message: string;
+            detail: string;
+            packageName?: string;
+            version?: string;
+        },
+    ): Diagnostic[] {
+        const diagnostics: Diagnostic[] = [];
+        const lines = content.split('\n');
+
+        if (!error.packageName) {
+            return diagnostics;
+        }
+
+        // Parse Dhall package references
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+
+            // Match package references in vessel.dhall format
+            const packageMatch = line.match(
+                new RegExp(`\\b${error.packageName}\\b`),
+            );
+            if (packageMatch) {
+                const startPos = line.indexOf(error.packageName);
+                const endPos = startPos + error.packageName.length;
+
+                diagnostics.push(
+                    createDiagnostic(i, startPos, endPos, error.message),
+                );
+            }
+        }
+
+        return diagnostics;
+    }
+
+    // Clear package diagnostics when errors are resolved
+    function clearPackageDiagnostics(directory: string) {
+        const configFiles = ['mops.toml', 'vessel.dhall'];
+
+        configFiles.forEach((filename) => {
+            const filePath = join(directory, filename);
+            if (existsSync(filePath)) {
+                const fileUri = URI.file(filePath).toString();
+                sendDiagnostics({
+                    uri: fileUri,
+                    diagnostics: [],
+                });
+            }
+        });
+    }
     async function getPackageSources(
         directory: string,
     ): Promise<[string, string][]> {
@@ -198,29 +553,19 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
                     }
                     sources = await sourcesFromCommand(command);
                 } catch (err: any) {
-                    // try {
-                    //     const sources = await mopsSources(directory);
-                    //     if (!sources) {
-                    //         throw new Error('Unexpected output');
-                    //     }
-                    //     return Object.entries(sources);
-                    // } catch (fallbackError) {
-                    //     console.error(
-                    //         `Error in fallback Mops implementation:`,
-                    //         fallbackError,
-                    //     );
-                    //     // Provide a verbose error message for Mops command
-                    //     throw new Error(
-                    //         `Error while running \`${command}\`: ${
-                    //             err?.message || err
-                    //         }`,
-                    //     );
-                    // }
+                    const parsedError = parseMopsError(err?.message || err);
+
+                    // Create diagnostics for the configuration file
+                    const packageDiagnostics = createPackageDiagnostics(
+                        directory,
+                        parsedError,
+                    );
+                    packageDiagnostics.forEach(({ uri, diagnostics }) => {
+                        sendDiagnostics({ uri, diagnostics });
+                    });
 
                     throw new Error(
-                        `Error while finding Mops packages.\nMake sure the latest version of Mops is installed locally or globally (https://docs.mops.one/quick-start).\n${
-                            err?.message || err
-                        }`,
+                        `${parsedError.message}\n${parsedError.detail}`,
                     );
                 }
             } else if (existsSync(join(directory, 'vessel.dhall'))) {
@@ -228,10 +573,51 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
                 try {
                     sources = await sourcesFromCommand(command);
                 } catch (err: any) {
+                    const errorMessage = String(err?.message || err);
+                    let vesselError;
+
+                    // Parse vessel-specific errors
+                    if (
+                        errorMessage.includes('command not found') ||
+                        errorMessage.includes('is not recognized')
+                    ) {
+                        vesselError = {
+                            message: 'Vessel not installed',
+                            detail: 'Vessel package manager is not installed or not in PATH.\n\nPlease install Vessel:\n• Follow instructions at https://github.com/dfinity/vessel/#getting-started',
+                        };
+                    } else if (
+                        errorMessage.includes('package') &&
+                        errorMessage.includes('not found')
+                    ) {
+                        // Try to extract package name from vessel error
+                        const packageMatch = errorMessage.match(
+                            /package[^"]*"([^"]+)"/i,
+                        );
+                        vesselError = {
+                            message: 'Vessel package error',
+                            detail: `${errorMessage}\n\nPlease check:\n• Package name spelling in vessel.dhall\n• Package availability in the vessel package set`,
+                            packageName: packageMatch
+                                ? packageMatch[1]
+                                : undefined,
+                        };
+
+                        // Create diagnostics for vessel.dhall
+                        const packageDiagnostics = createPackageDiagnostics(
+                            directory,
+                            vesselError,
+                        );
+                        packageDiagnostics.forEach(({ uri, diagnostics }) => {
+                            sendDiagnostics({ uri, diagnostics });
+                        });
+                    } else {
+                        vesselError = {
+                            message: 'Error while running vessel sources',
+                            detail: `${errorMessage}\n\nFor help, visit:\n• Vessel documentation: https://github.com/dfinity/vessel/#getting-started`,
+                        };
+                    }
+
                     throw new Error(
-                        `Error while running \`${command}\`.\nMake sure Vessel is installed (https://github.com/dfinity/vessel/#getting-started).\n${
-                            err?.message || err
-                        }`,
+                        `${vesselError.message}\n${vesselError.detail}`,
                     );
                     // return vesselSources(directory);
                 }
@@ -337,6 +723,10 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
 
                             try {
                                 context.packages = await getPackageSources(dir);
+
+                                // Clear any existing package diagnostics since loading was successful
+                                clearPackageDiagnostics(dir);
+
                                 context.packages.forEach(
                                     ([name, relativePath]) => {
                                         const path = resolveVirtualPath(
@@ -354,22 +744,23 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
                                     },
                                 );
                             } catch (err) {
-                                connection.sendNotification(ERROR_MESSAGE, {
-                                    message: `Error while resolving Motoko packages:`,
-                                    detail: String(err).replace(/^Error: /, ''),
-                                });
+                                const { message, detail } = parseErrorMessage(
+                                    err,
+                                    'Error while resolving Motoko packages',
+                                );
+
+                                sendErrorMessage(message, detail);
                                 context.error = String(err);
-                                console.warn(err);
                                 return;
                             }
                         } catch (err: any) {
-                            connection.sendNotification(ERROR_MESSAGE, {
-                                message: `Error while loading Motoko packages:`,
-                                detail: String(err).replace(/^Error: /, ''),
-                            });
-                            console.error(
-                                `Error while reading packages for directory (${dir}): ${err}`,
+                            const { message, detail } = parseErrorMessage(
+                                err,
+                                'Error while loading Motoko packages',
+                                `Error in directory: ${dir}`,
                             );
+
+                            sendErrorMessage(message, detail);
                             return;
                         }
                     }),
@@ -619,6 +1010,23 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
     connection.onInitialize((event): InitializeResult => {
         workspaceFolders = event.workspaceFolders || undefined;
 
+        if (event.initializationOptions) {
+            try {
+                const initOptions = event.initializationOptions;
+
+                if (initOptions.motoko) {
+                    settings = initOptions.motoko;
+                }
+
+                console.log(
+                    'Loaded settings from initializationOptions:',
+                    JSON.stringify(settings),
+                );
+            } catch (err) {
+                console.warn('Failed to process initializationOptions:', err);
+            }
+        }
+
         const result: InitializeResult = {
             capabilities: {
                 completionProvider: {
@@ -676,9 +1084,32 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
         });
 
         notifyPackageConfigChange();
+
+        // Initialize file watching system
+        initializeFileWatching();
     });
 
+    // Hybrid file watching implementation
     connection.onDidChangeWatchedFiles((event) => {
+        console.log('Received LSP client file change notification');
+
+        // Record that client watching is working
+        if (clientWatchingTimeout) {
+            clearTimeout(clientWatchingTimeout);
+        }
+
+        clientWatchingTimeout = setTimeout(() => {
+            // If no client notifications for 5 seconds, switch to server-side watching
+            if (!useServerSideWatching) {
+                console.log(
+                    'LSP client watching seems inactive after 5 seconds, switching to server-side watching',
+                );
+                useServerSideWatching = true;
+                setupServerSideFileWatching();
+                logFileWatchingStatus();
+            }
+        }, 5000);
+
         event.changes.forEach((change) => {
             try {
                 if (change.type === FileChangeType.Deleted) {
@@ -705,6 +1136,7 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
                     change.uri.endsWith('.dhall') ||
                     change.uri.endsWith('/mops.toml')
                 ) {
+                    console.log('Package config changed (LSP client)');
                     notifyPackageConfigChange();
                 }
             } catch (err) {
@@ -717,8 +1149,490 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
         checkWorkspace();
     });
 
+    // Server-side file watching functions
+    function validateFileWatchingSettings(
+        settings: MotokoSettings['fileWatching'],
+    ): {
+        isValid: boolean;
+        errors: string[];
+        corrected: MotokoSettings['fileWatching'];
+    } {
+        const errors: string[] = [];
+        const corrected: MotokoSettings['fileWatching'] = { ...settings };
+
+        // Validate method
+        const validMethods = ['client', 'server', 'hybrid', 'polling'];
+        if (settings?.method && !validMethods.includes(settings.method)) {
+            errors.push(
+                `Invalid file watching method: ${
+                    settings.method
+                }. Valid options: ${validMethods.join(', ')}`,
+            );
+            corrected.method = 'hybrid';
+        }
+
+        // Validate polling interval
+        if (settings?.pollingInterval !== undefined) {
+            const interval = settings.pollingInterval;
+            if (
+                typeof interval !== 'number' ||
+                interval < 500 ||
+                interval > 60000
+            ) {
+                errors.push(
+                    `Invalid polling interval: ${interval}. Must be between 500ms and 60000ms`,
+                );
+                corrected.pollingInterval = 2000;
+            }
+        }
+
+        // Validate enableServerSide
+        if (
+            settings?.enableServerSide !== undefined &&
+            typeof settings.enableServerSide !== 'boolean'
+        ) {
+            errors.push(
+                `Invalid enableServerSide value: ${settings.enableServerSide}. Must be boolean`,
+            );
+            corrected.enableServerSide = true;
+        }
+
+        return {
+            isValid: errors.length === 0,
+            errors,
+            corrected,
+        };
+    }
+
+    function getFileWatchingSettings(): MotokoSettings['fileWatching'] {
+        const defaultSettings = {
+            method: 'hybrid' as const,
+            pollingInterval: 2000,
+            enableServerSide: true,
+        };
+
+        // Create hash of current settings for cache invalidation
+        const currentSettingsHash = JSON.stringify(
+            settings?.fileWatching || null,
+        );
+
+        // Return cached settings if they haven't changed
+        if (
+            cachedFileWatchingSettings &&
+            lastSettingsHash === currentSettingsHash
+        ) {
+            return cachedFileWatchingSettings;
+        }
+
+        if (!settings?.fileWatching) {
+            cachedFileWatchingSettings = defaultSettings;
+            lastSettingsHash = currentSettingsHash;
+            return defaultSettings;
+        }
+
+        const validation = validateFileWatchingSettings(settings.fileWatching);
+
+        if (!validation.isValid) {
+            console.warn('Invalid file watching settings detected:');
+            validation.errors.forEach((error) => console.warn(`  - ${error}`));
+            console.warn(
+                'Using corrected settings:',
+                JSON.stringify(validation.corrected),
+            );
+
+            // Send notification to client about invalid settings
+            sendWarningMessage(
+                'Invalid file watching settings detected',
+                validation.errors.join('\n') + '\nUsing corrected defaults.',
+            );
+        }
+
+        const result = {
+            ...defaultSettings,
+            ...validation.corrected,
+        };
+
+        // Cache the result
+        cachedFileWatchingSettings = result;
+        lastSettingsHash = currentSettingsHash;
+
+        return result;
+    }
+
+    function setupServerSideFileWatching() {
+        const watchSettings = getFileWatchingSettings();
+
+        console.log(
+            'Setting up server-side file watching with settings:',
+            JSON.stringify(watchSettings),
+        );
+
+        if (!watchSettings?.enableServerSide) {
+            console.log('Server-side file watching is disabled in settings');
+            return;
+        }
+
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            console.warn('No workspace folders available for file watching');
+            return;
+        }
+
+        console.log(
+            `Setting up server-side watching for ${workspaceFolders.length} workspace folder(s)`,
+        );
+
+        const successCount = 0;
+        let errorCount = 0;
+
+        workspaceFolders?.forEach((workspaceFolder) => {
+            const directory = resolveFilePath(workspaceFolder.uri);
+
+            if (watchedDirectories.has(directory)) {
+                console.log(`Directory already being watched: ${directory}`);
+                return; // Already watching
+            }
+
+            watchedDirectories.add(directory);
+            console.log(
+                `Adding server-side watching for directory: ${directory}`,
+            );
+
+            const configFiles = ['mops.toml', 'vessel.dhall', 'dfx.json'];
+
+            configFiles.forEach((filename) => {
+                const filePath = join(directory, filename);
+
+                try {
+                    const watcher = watch(
+                        filePath,
+                        (eventType, changedFilename) => {
+                            if (eventType === 'change') {
+                                console.log(
+                                    `Server-side detected change in: ${filePath}`,
+                                );
+
+                                if (
+                                    filename === 'mops.toml' ||
+                                    filename === 'vessel.dhall'
+                                ) {
+                                    notifyPackageConfigChange();
+                                } else if (filename === 'dfx.json') {
+                                    notifyDfxChange();
+                                    notifyPackageConfigChange();
+                                }
+                            }
+                        },
+                    );
+
+                    fileWatchers.set(filePath, watcher);
+                    console.log(`Server-side watching: ${filePath}`);
+                } catch (err) {
+                    errorCount++;
+                    console.log(
+                        `File not found for watching: ${filePath} (${
+                            err instanceof Error ? err.message : err
+                        })`,
+                    );
+                }
+            });
+
+            // Watch directory for new config files
+            try {
+                const dirWatcher = watch(
+                    directory,
+                    { recursive: false },
+                    (eventType, filename) => {
+                        if (filename && configFiles.includes(filename)) {
+                            console.log(
+                                `Server-side detected ${eventType} for: ${filename}`,
+                            );
+
+                            if (eventType === 'rename') {
+                                // File was created, add individual watcher
+                                const filePath = join(directory, filename);
+                                if (!fileWatchers.has(filePath)) {
+                                    try {
+                                        const fileWatcher = watch(
+                                            filePath,
+                                            (eventType) => {
+                                                if (eventType === 'change') {
+                                                    console.log(
+                                                        `Server-side detected change in new file: ${filePath}`,
+                                                    );
+                                                    if (
+                                                        filename ===
+                                                            'mops.toml' ||
+                                                        filename ===
+                                                            'vessel.dhall'
+                                                    ) {
+                                                        notifyPackageConfigChange();
+                                                    } else if (
+                                                        filename === 'dfx.json'
+                                                    ) {
+                                                        notifyDfxChange();
+                                                        notifyPackageConfigChange();
+                                                    }
+                                                }
+                                            },
+                                        );
+                                        fileWatchers.set(filePath, fileWatcher);
+                                    } catch (err) {
+                                        console.warn(
+                                            `Failed to watch new file: ${filePath}`,
+                                            err,
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Trigger immediate change notification
+                            if (
+                                filename === 'mops.toml' ||
+                                filename === 'vessel.dhall'
+                            ) {
+                                notifyPackageConfigChange();
+                            } else if (filename === 'dfx.json') {
+                                notifyDfxChange();
+                                notifyPackageConfigChange();
+                            }
+                        }
+                    },
+                );
+
+                fileWatchers.set(`${directory}_dir`, dirWatcher);
+            } catch (err) {
+                errorCount++;
+                console.warn(
+                    `Failed to watch directory: ${directory}`,
+                    err instanceof Error ? err.message : err,
+                );
+            }
+        });
+
+        console.log(
+            `Server-side file watching setup completed. Success: ${successCount}, Errors: ${errorCount}`,
+        );
+    }
+
+    function setupPollingWatching() {
+        const watchSettings = getFileWatchingSettings();
+
+        if (pollingInterval) {
+            clearInterval(pollingInterval);
+        }
+
+        if (!workspaceFolders || workspaceFolders.length === 0) {
+            console.warn('No workspace folders available for polling');
+            return;
+        }
+
+        pollingInterval = setInterval(() => {
+            workspaceFolders?.forEach((workspaceFolder) => {
+                const directory = resolveFilePath(workspaceFolder.uri);
+                const configFiles = ['mops.toml', 'vessel.dhall', 'dfx.json'];
+
+                configFiles.forEach((filename) => {
+                    const filePath = join(directory, filename);
+
+                    try {
+                        const stats = statSync(filePath);
+                        const currentMtime = stats.mtime.getTime();
+                        const lastMtime = fileModificationTimes.get(filePath);
+
+                        if (lastMtime === undefined) {
+                            fileModificationTimes.set(filePath, currentMtime);
+                        } else if (currentMtime > lastMtime) {
+                            console.log(
+                                `Polling detected change in: ${filePath}`,
+                            );
+                            fileModificationTimes.set(filePath, currentMtime);
+
+                            if (
+                                filename === 'mops.toml' ||
+                                filename === 'vessel.dhall'
+                            ) {
+                                notifyPackageConfigChange();
+                            } else if (filename === 'dfx.json') {
+                                notifyDfxChange();
+                                notifyPackageConfigChange();
+                            }
+                        }
+                    } catch (err) {
+                        if (fileModificationTimes.has(filePath)) {
+                            fileModificationTimes.delete(filePath);
+                        }
+                    }
+                });
+            });
+        }, watchSettings?.pollingInterval || 2000);
+
+        console.log(
+            `Started polling file watcher (${
+                watchSettings?.pollingInterval || 2000
+            }ms interval) for ${
+                workspaceFolders?.length || 0
+            } workspace folder(s)`,
+        );
+    }
+
+    function cleanupFileWatchers() {
+        console.log(`Cleaning up ${fileWatchers.size} file watcher(s)`);
+        fileWatchers.forEach((watcher, path) => {
+            try {
+                watcher.close();
+                console.log(`Stopped watching: ${path}`);
+            } catch (err) {
+                console.warn(
+                    `Failed to close watcher for ${path}:`,
+                    err instanceof Error ? err.message : err,
+                );
+            }
+        });
+        fileWatchers.clear();
+        watchedDirectories.clear();
+        console.log('File watcher cleanup completed');
+    }
+
+    function stopPollingWatching() {
+        if (pollingInterval) {
+            clearInterval(pollingInterval);
+            pollingInterval = null;
+            console.log('Stopped polling file watcher');
+        }
+        fileModificationTimes.clear();
+    }
+
+    function initializeFileWatching() {
+        const watchSettings = getFileWatchingSettings();
+
+        console.log('Initializing file watching system');
+        console.log('File watching settings:', JSON.stringify(watchSettings));
+        console.log(
+            'Workspace folders:',
+            workspaceFolders?.map((f) => resolveFilePath(f.uri)),
+        );
+
+        switch (watchSettings?.method) {
+            case 'server':
+                console.log('Using server-side file watching only');
+                useServerSideWatching = true;
+                setupServerSideFileWatching();
+                break;
+
+            case 'polling':
+                console.log('Using polling file watching only');
+                setupPollingWatching();
+                break;
+
+            case 'client':
+                console.log('Using LSP client file watching only');
+                // Do nothing, rely on client
+                break;
+
+            case 'hybrid':
+            default:
+                console.log(
+                    'Initializing hybrid file watching (LSP client first, server-side fallback)',
+                );
+
+                // Check if client watching is working after 3 seconds
+                setTimeout(() => {
+                    if (!clientWatchingTimeout) {
+                        console.log(
+                            'No LSP client file watching detected after 3 seconds, switching to server-side watching',
+                        );
+                        useServerSideWatching = true;
+                        setupServerSideFileWatching();
+                        logFileWatchingStatus();
+                    } else {
+                        console.log(
+                            'LSP client file watching is active and working',
+                        );
+                        logFileWatchingStatus();
+                    }
+                }, 3000);
+                break;
+        }
+
+        // Log final status after initialization
+        setTimeout(() => {
+            logFileWatchingStatus();
+        }, 100);
+    }
+
+    function logFileWatchingStatus() {
+        const watchSettings = getFileWatchingSettings();
+        console.log('=== File Watching Status ===');
+        console.log(`Method: ${watchSettings?.method || 'hybrid'}`);
+        console.log(`Server-side active: ${useServerSideWatching}`);
+        console.log(
+            `Client watching timeout set: ${clientWatchingTimeout !== null}`,
+        );
+        console.log(`Polling active: ${pollingInterval !== null}`);
+        console.log(
+            `Watched directories: ${Array.from(watchedDirectories).join(', ')}`,
+        );
+        console.log(`Active watchers: ${fileWatchers.size}`);
+        console.log(`Workspace folders: ${workspaceFolders?.length || 0}`);
+        console.log('============================');
+    }
+
     connection.onDidChangeConfiguration((event) => {
+        const oldSettings = settings;
         settings = (<Settings>event.settings).motoko;
+
+        // Check if file watching settings have changed
+        const oldWatchSettings = oldSettings?.fileWatching;
+        const newWatchSettings = settings?.fileWatching;
+
+        const watchingSettingsChanged =
+            JSON.stringify(oldWatchSettings) !==
+            JSON.stringify(newWatchSettings);
+
+        if (watchingSettingsChanged) {
+            console.log('File watching settings changed, reinitializing...');
+            console.log('Old settings:', JSON.stringify(oldWatchSettings));
+            console.log('New settings:', JSON.stringify(newWatchSettings));
+
+            // Clear settings cache
+            cachedFileWatchingSettings = null;
+            lastSettingsHash = null;
+
+            try {
+                // Cleanup existing watchers
+                cleanupFileWatchers();
+                stopPollingWatching();
+
+                // Reset state
+                useServerSideWatching = false;
+                if (clientWatchingTimeout) {
+                    clearTimeout(clientWatchingTimeout);
+                    clientWatchingTimeout = null;
+                }
+
+                // Reinitialize with new settings
+                console.log(
+                    'Reinitializing file watching with new settings...',
+                );
+                initializeFileWatching();
+
+                console.log(
+                    'File watching reinitialization completed successfully',
+                );
+            } catch (err) {
+                console.error(
+                    'Failed to reinitialize file watching:',
+                    err instanceof Error ? err.message : err,
+                );
+                sendErrorMessage(
+                    'Failed to update file watching settings',
+                    `Error: ${
+                        err instanceof Error ? err.message : err
+                    }\nFile watching may not work correctly until language server restart.`,
+                );
+            }
+        }
+
         notifyPackageConfigChange();
     });
 
@@ -2083,6 +2997,25 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
             diagnostics: [],
         });
         checkWorkspace();
+    });
+
+    // Connection cleanup handlers
+    connection.onExit(() => {
+        cleanupFileWatchers();
+        stopPollingWatching();
+    });
+
+    // Process signal handlers for cleanup
+    process.on('SIGINT', () => {
+        cleanupFileWatchers();
+        stopPollingWatching();
+        process.exit(0);
+    });
+
+    process.on('SIGTERM', () => {
+        cleanupFileWatchers();
+        stopPollingWatching();
+        process.exit(0);
     });
 
     documents.listen(connection);
