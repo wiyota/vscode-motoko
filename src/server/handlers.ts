@@ -22,7 +22,6 @@ import {
     InitializeResult,
     Location,
     MarkupKind,
-    MessageType,
     Position,
     Range,
     ReferenceParams,
@@ -191,9 +190,11 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
         sendMessage('warning', message, detail);
     }
 
+    /*
     function sendInfoMessage(message: string, detail?: string) {
         sendMessage('info', message, detail, false);
     }
+    */
 
     // Parse error messages into structured format
     function parseErrorMessage(
@@ -1303,26 +1304,23 @@ export const addHandlers = (connection: Connection, redirectConsole = true) => {
                 const filePath = join(directory, filename);
 
                 try {
-                    const watcher = watch(
-                        filePath,
-                        (eventType, changedFilename) => {
-                            if (eventType === 'change') {
-                                console.log(
-                                    `Server-side detected change in: ${filePath}`,
-                                );
+                    const watcher = watch(filePath, (eventType, _) => {
+                        if (eventType === 'change') {
+                            console.log(
+                                `Server-side detected change in: ${filePath}`,
+                            );
 
-                                if (
-                                    filename === 'mops.toml' ||
-                                    filename === 'vessel.dhall'
-                                ) {
-                                    notifyPackageConfigChange();
-                                } else if (filename === 'dfx.json') {
-                                    notifyDfxChange();
-                                    notifyPackageConfigChange();
-                                }
+                            if (
+                                filename === 'mops.toml' ||
+                                filename === 'vessel.dhall'
+                            ) {
+                                notifyPackageConfigChange();
+                            } else if (filename === 'dfx.json') {
+                                notifyDfxChange();
+                                notifyPackageConfigChange();
                             }
-                        },
-                    );
+                        }
+                    });
 
                     fileWatchers.set(filePath, watcher);
                     console.log(`Server-side watching: ${filePath}`);
