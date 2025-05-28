@@ -1,19 +1,17 @@
 name: Release
 
 on:
-  release:
-    types:
-    - published
-  workflow_dispatch:
+    release:
+        types:
+            - published
+    workflow_dispatch:
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
-    - name: Publish
-      run: |
-        npm install
-        npm run publish
-      env:
-        VSCE_PAT: ${{ secrets.VSCE_PAT }}
+    publish:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v3
+            - name: Publish
+              run: |
+                  npm install
+                  npm run package
